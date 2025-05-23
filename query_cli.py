@@ -4,7 +4,7 @@
 import os
 import argparse
 import sys
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from openai import OpenAI
 import weaviate
 from weaviate.classes.init import Auth
@@ -46,12 +46,22 @@ def setup_weaviate_client():
 # Cache for sentence transformer model - load only once
 _model_cache = None
 
+# Cache for reranker model - load only once
+_reranker_model_cache = None
+
 def get_model():
     """Get or create the sentence transformer model."""
     global _model_cache
     if _model_cache is None:
         _model_cache = SentenceTransformer("BAAI/bge-m3")
     return _model_cache
+
+def get_reranker_model():
+    """Get or create the reranker model."""
+    global _reranker_model_cache
+    if _reranker_model_cache is None:
+        _reranker_model_cache = CrossEncoder("BAAI/bge-reranker-large")
+    return _reranker_model_cache
 
 def query_constitution(query_text, weaviate_client, openai_api_key, collection_name="ROC_Constitution_BG3_M3", limit=5):
     """
@@ -70,6 +80,7 @@ def query_constitution(query_text, weaviate_client, openai_api_key, collection_n
     try:
         # Load embedding model (using cache)
         model = get_model()
+        reranker = get_reranker_model()
         
         # Embed query using the SAME model as your document vectors
         query_vector = model.encode(query_text, normalize_embeddings=True)
@@ -90,9 +101,19 @@ def query_constitution(query_text, weaviate_client, openai_api_key, collection_n
         if not results.objects:
             return "No results found. Please try a different query."
         
+        pairs = [(query_text, object.properties.get("content")) for object in results.objects]
+        scores = reranker.predict(pairs)
+        # Reorder chunks based on reranker scores
+        ranked_chunks = sorted(
+            zip(results.objects, scores),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+
         # Format the context with metadata
         context_chunks = []
-        for obj in results.objects:
+        for obj, _ in ranked_chunks:
             properties = obj.properties
             chunk = f"--- {properties.get('title', 'Unknown')}"
             
@@ -156,7 +177,8 @@ def main():
         # Check for exit command
         if query.lower() in ['exit', 'quit', 'q']:
             print("Goodbye!")
-            break
+            weaviate_client.close()
+            sys.exit(0)
         
         try:
             # Query the constitution
