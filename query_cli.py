@@ -9,6 +9,10 @@ from openai import OpenAI
 import weaviate
 from weaviate.classes.init import Auth
 from dotenv import load_dotenv
+import os
+
+# Set tokenizers parallelism to False before importing any HuggingFace libraries
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def setup_weaviate_client():
     """Initialize and return a Weaviate client."""
@@ -22,9 +26,6 @@ def setup_weaviate_client():
     assert WEAVIATE_URL, "WEAVIATE_URL is not set"
     assert WEAVIATE_API_KEY, "WEAVIATE_API_KEY is not set"
     assert OPENAI_API_KEY, "OPENAI_API_KEY is not set"
-    
-    # Validate required environment variables
-
     
     # Connect to Weaviate
     client = weaviate.connect_to_weaviate_cloud(
@@ -42,6 +43,16 @@ def setup_weaviate_client():
     
     return client, OPENAI_API_KEY
 
+# Cache for sentence transformer model - load only once
+_model_cache = None
+
+def get_model():
+    """Get or create the sentence transformer model."""
+    global _model_cache
+    if _model_cache is None:
+        _model_cache = SentenceTransformer("BAAI/bge-m3")
+    return _model_cache
+
 def query_constitution(query_text, weaviate_client, openai_api_key, collection_name="ROC_Constitution_BG3_M3", limit=5):
     """
     Query the ROC Constitution using vector search and generate a response.
@@ -56,62 +67,76 @@ def query_constitution(query_text, weaviate_client, openai_api_key, collection_n
     Returns:
         The generated response
     """
-    # Load embedding model
-    model = SentenceTransformer("BAAI/bge-m3")
-    
-    # Embed query using the SAME model as your document vectors
-    query_vector = model.encode(query_text, normalize_embeddings=True)
-    
-    # Run vector search manually
-    results = weaviate_client.query.get(
-        collection_name, 
-        ["title", "content", "article", "chapter", "section"]
-    ).with_near_vector(
-        {"vector": query_vector.tolist()}
-    ).with_limit(limit).do()
-    
-    # Extract top texts for context
-    result_data = results.get("data", {}).get("Get", {}).get(collection_name, [])
-    
-    if not result_data:
-        return "No results found. Please try a different query."
-    
-    # Format the context with metadata
-    context_chunks = []
-    for doc in result_data:
-        chunk = f"--- {doc.get('title', 'Unknown')}"
+    try:
+        # Load embedding model (using cache)
+        model = get_model()
         
-        if doc.get('chapter'):
-            chunk += f" | {doc.get('chapter')}"
+        # Embed query using the SAME model as your document vectors
+        query_vector = model.encode(query_text, normalize_embeddings=True)
         
-        if doc.get('section') and doc.get('section') != doc.get('chapter'):
-            chunk += f" | {doc.get('section')}"
+        # Get the collection object
+        collection = weaviate_client.collections.get(collection_name)
+        
+        # Run vector search using the current API
+        results = collection.query.hybrid(
+            query=query_text,
+            vector=query_vector.tolist(),
+            alpha=0.5,
+            limit=limit,
+            return_properties=["title", "content", "article", "chapter", "section"]
+        )
+        
+        # Check if we got results
+        if not results.objects:
+            return "No results found. Please try a different query."
+        
+        # Format the context with metadata
+        context_chunks = []
+        for obj in results.objects:
+            properties = obj.properties
+            chunk = f"--- {properties.get('title', 'Unknown')}"
             
-        if doc.get('article'):
-            chunk += f" | Article {doc.get('article')}"
+            if properties.get('chapter'):
+                chunk += f" | {properties.get('chapter')}"
             
-        chunk += f" ---\n{doc.get('content', '')}"
-        context_chunks.append(chunk)
-    
-    context = "\n\n".join(context_chunks)
-    
-    # Generate final answer using OpenAI
-    openai_client = OpenAI(api_key=openai_api_key)
-    response = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant answering questions about the Republic of China (Taiwan) constitution. Answer the question based only on the provided context. If the answer is not in the context, say you don't know."},
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query_text}"}
-        ]
-    )
-    
-    return response.choices[0].message.content
+            if properties.get('section') and properties.get('section') != properties.get('chapter'):
+                chunk += f" | {properties.get('section')}"
+                
+            if properties.get('article'):
+                chunk += f" | Article {properties.get('article')}"
+                
+            chunk += f" ---\n{properties.get('content', '')}"
+            context_chunks.append(chunk)
+        
+        context = "\n\n".join(context_chunks)
+        
+        # Generate final answer using OpenAI with error handling
+        try:
+            openai_client = OpenAI(api_key=openai_api_key)
+            response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant answering questions about the Republic of China (Taiwan) constitution. Answer the question based only on the provided context. If the answer is not in the context, say you don't know."},
+                    {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query_text}"}
+                ]
+            )
+            return response.choices[0].message.content
+        except Exception as api_error:
+            if "insufficient_quota" in str(api_error) or "429" in str(api_error):
+                return f"OpenAI API quota exceeded. Please check your billing details or try again later.\n\nHere's the raw context that was found:\n\n{context}"
+            else:
+                raise
+            
+    except Exception as e:
+        print(f"Error in query_constitution: {str(e)}")
+        raise
 
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description='Query the ROC Constitution')
     parser.add_argument('-q', '--query', help='The query to run')
     parser.add_argument('-l', '--limit', type=int, default=5, help='Number of chunks to retrieve (default: 5)')
+    parser.add_argument('--local', action='store_true', help='Use local processing only (no OpenAI API call)')
     args = parser.parse_args()
     
     # Initialize Weaviate client
@@ -136,12 +161,31 @@ def main():
         try:
             # Query the constitution
             print("\nQuerying...\n")
-            result = query_constitution(query, weaviate_client, openai_api_key, limit=args.limit)
             
-            # Print the result
-            print("-" * 60)
-            print(result)
-            print("-" * 60)
+            if args.local:
+                # Local mode - just retrieve the context without OpenAI processing
+                model = get_model()
+                query_vector = model.encode(query, normalize_embeddings=True)
+                collection = weaviate_client.collections.get("ROC_Constitution_BG3_M3")
+                results = collection.query.near_vector(
+                    near_vector=query_vector.tolist(),
+                    limit=args.limit,
+                    return_properties=["title", "content", "article", "chapter", "section"]
+                )
+                
+                print("-" * 60)
+                for obj in results.objects:
+                    properties = obj.properties
+                    print(f"--- {properties.get('title', 'Unknown')} | {properties.get('chapter') or ''} | Article {properties.get('article') or ''} ---")
+                    print(properties.get('content', ''))
+                    print("-" * 30)
+                print("-" * 60)
+            else:
+                # Normal mode with OpenAI processing
+                result = query_constitution(query, weaviate_client, openai_api_key, limit=args.limit)
+                print("-" * 60)
+                print(result)
+                print("-" * 60)
             
         except Exception as e:
             print(f"Error: {str(e)}")

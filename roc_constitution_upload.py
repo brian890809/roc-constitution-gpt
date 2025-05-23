@@ -7,14 +7,27 @@ Original file is located at
     https://colab.research.google.com/drive/1CYNmNegyaav2LqLu40QeTTF1Pt_nEIbs
 """
 
+# Set environment variable to disable tokenizers parallelism before imports
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import json
 import weaviate
 from weaviate.classes.init import Auth
-import os
 from sentence_transformers import SentenceTransformer
 from weaviate.util import generate_uuid5
 import weaviate.classes.config as wc
 from dotenv import load_dotenv
+
+# Cache for sentence transformer model - load only once
+_model_cache = None
+
+def get_model():
+    """Get or create the sentence transformer model."""
+    global _model_cache
+    if _model_cache is None:
+        _model_cache = SentenceTransformer("BAAI/bge-m3")
+    return _model_cache
 
 load_dotenv()
 WEAVIATE_URL = os.getenv("WEAVIATE_URL")
@@ -31,7 +44,7 @@ client = weaviate.connect_to_weaviate_cloud(
         "X-OpenAI-Api-Key": OPENAI_API_KEY
     }
 )
-model = SentenceTransformer("BAAI/bge-m3")
+model = get_model()
 
 assert client.is_ready(), "Weaviate client is not ready. Check credentials and endpoint."
 
@@ -68,6 +81,9 @@ def bulk_upload_space_chunks_to_weaviate(json_file_path, collection_name="ROC_Co
     successful_uploads = 0
     skipped_existing = 0
     updated_existing = 0
+    
+    # Use the cached model
+    model = get_model()
 
     with docs_collection.batch.fixed_size(batch_size=50, concurrent_requests=2) as batch:
         for i, chunk in enumerate(chunks):
